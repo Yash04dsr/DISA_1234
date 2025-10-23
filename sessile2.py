@@ -1,161 +1,321 @@
 import sys
 import cv2
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
-                             QLabel, QFileDialog, QSlider, QHBoxLayout)
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton,
+    QLabel, QFileDialog, QSlider, QHBoxLayout, QSizePolicy
+)
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt
+
+
+# ============================ Image / Geometry Utils ============================
+
+def adaptive_drop_mask(bgr):
+    """Create a robust binary mask for the droplet under uneven lighting."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    mask = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        51, 2
+    )
+    k = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
+    return mask
+
+
+def choose_droplet_contour(mask):
+    """Pick the most plausible droplet contour by area × circularity score."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    best, best_score = None, 0.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 500:
+            continue
+        per = cv2.arcLength(c, True)
+        circularity = 4.0 * np.pi * area / (per * per + 1e-6)
+        score = area * circularity
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def find_auto_baseline_from_contour(cnt):
+    """Use a high percentile of contour y to place the baseline near the bottom."""
+    ys = cnt[:, 0, 1]
+    return int(np.percentile(ys, 95))
+
+
+def refine_contact_point(gray, point, search_radius=5):
+    """Shift the point to the location of maximum intensity gradient magnitude."""
+    if point is None:
+        return None
+    x0, y0 = int(point[0]), int(point[1])
+    h, w = gray.shape
+    best = (x0, y0)
+    best_g = 0
+    for dy in range(-search_radius, search_radius + 1):
+        for dx in range(-search_radius, search_radius + 1):
+            x, y = x0 + dx, y0 + dy
+            if 1 <= x < w - 1 and 1 <= y < h - 1:
+                gx = int(gray[y, x + 1]) - int(gray[y, x - 1])
+                gy = int(gray[y + 1, x]) - int(gray[y - 1, x])
+                g2 = gx * gx + gy * gy
+                if g2 > best_g:
+                    best_g = g2
+                    best = (x, y)
+    return best
+
+
+def fit_circle_and_intersect(cnt, baseline_y, gray=None, refine=True):
+    """
+    Fit a circle to the *upper* contour (avoid distorted base) and intersect with baseline.
+    Optionally refine intersection locations by local gradient.
+    """
+    pts = cnt[:, 0, :].astype(np.float32)
+    if len(pts) < 10:
+        return None, None
+
+    # keep only the upper 70% of points (y smaller = higher in image)
+    y_min, y_max = np.min(pts[:, 1]), np.max(pts[:, 1])
+    cutoff = y_min + 0.70 * (y_max - y_min)
+    upper = pts[pts[:, 1] < cutoff]
+    if len(upper) < 10:
+        upper = pts  # fallback
+
+    (cx, cy), r = cv2.minEnclosingCircle(upper)
+
+    # Intersections of (x - cx)^2 + (y - cy)^2 = r^2 with y = baseline_y
+    dy = baseline_y - cy
+    if abs(dy) >= r:
+        return None, None  # circle doesn't cross baseline
+    dx = float(np.sqrt(max(r * r - dy * dy, 0.0)))
+
+    left  = (int(round(cx - dx)), int(baseline_y))
+    right = (int(round(cx + dx)), int(baseline_y))
+
+    if refine and gray is not None:
+        left  = refine_contact_point(gray, left, 5)
+        right = refine_contact_point(gray, right, 5)
+
+    return left, right
+
+
+def local_poly_contact_angle(cnt, contact_pt, window_px=25):
+    """
+    Local quadratic fit around contact point, then angle = atan(|dy/dx|).
+    Returns angle in degrees.
+    """
+    if contact_pt is None:
+        return None
+    cx, _ = contact_pt
+    pts = cnt[:, 0, :]
+    nb = pts[np.abs(pts[:, 0] - cx) < window_px]
+    if len(nb) < 8:
+        nb = pts[np.abs(pts[:, 0] - cx) < window_px * 1.8]
+    if len(nb) < 8:
+        return None
+
+    x = nb[:, 0].astype(np.float64)
+    y = nb[:, 1].astype(np.float64)
+    try:
+        a, b, c = np.polyfit(x, y, 2)
+    except Exception:
+        return None
+
+    m = 2.0 * a * cx + b
+    theta = np.degrees(np.arctan(np.abs(m)))
+    return float(np.clip(theta, 0.0, 175.0))
+
+
+def apex_of_contour(cnt):
+    """Highest point (minimum y)."""
+    if cnt is None or len(cnt) == 0:
+        return None
+    idx = np.argmin(cnt[:, 0, 1])
+    return tuple(cnt[idx, 0, :])
+
+
+# ============================ PyQt5 Application ============================
 
 class SessileDropAnalyzer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Sessile Drop Contact Angle Analyzer (Responsive UI)')
-        self.setGeometry(100, 100, 1000, 800)
-        
-        # --- State Management Attributes ---
+        self.setWindowTitle("Sessile Drop Contact Angle Analyzer (Circle-Fit + Refinement)")
+        self.setGeometry(100, 100, 1150, 830)
+
         self.original_image = None
-        self.last_analyzed_image = None # Stores the image with contours/points, but no baseline
         self.current_pixmap = None
+        self.overlay = None
 
-        # --- GUI Setup ---
-        self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
+        # --- Layout / Widgets ---
+        layout = QVBoxLayout(self)
+        self.setLayout(layout)
 
-        self.image_label = QLabel('Please load an image of a droplet.')
+        self.image_label = QLabel("Load a side-view droplet image.")
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("border: 2px solid gray;")
-        self.layout.addWidget(self.image_label, 1)
+        self.image_label.setStyleSheet("border: 2px solid #888;")
+        self.image_label.setMinimumSize(720, 460)
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.image_label, stretch=1)
 
-        controls_layout = QHBoxLayout()
-        self.btn_load = QPushButton('Load Image')
-        controls_layout.addWidget(self.btn_load)
-
-        self.slider_label = QLabel('Baseline Position:')
-        controls_layout.addWidget(self.slider_label)
+        controls = QHBoxLayout()
+        layout.addLayout(controls)
+        self.btn_load = QPushButton("Load Image")
+        controls.addWidget(self.btn_load)
+        controls.addWidget(QLabel("Baseline (y):"))
         self.slider = QSlider(Qt.Horizontal)
-        controls_layout.addWidget(self.slider)
-        
-        self.layout.addLayout(controls_layout)
+        self.slider.setEnabled(False)
+        controls.addWidget(self.slider)
 
-        results_layout = QHBoxLayout()
-        self.left_angle_label = QLabel('Left Angle: --°')
-        self.right_angle_label = QLabel('Right Angle: --°')
-        results_layout.addWidget(self.left_angle_label)
-        results_layout.addWidget(self.right_angle_label)
-        self.layout.addLayout(results_layout)
-        
-        # --- Signal Connections ---
+        results = QHBoxLayout()
+        layout.addLayout(results)
+        self.left_angle_label = QLabel("Left Angle: --°")
+        self.right_angle_label = QLabel("Right Angle: --°")
+        results.addWidget(self.left_angle_label)
+        results.addWidget(self.right_angle_label)
+
+        # --- Signals ---
         self.btn_load.clicked.connect(self.load_image)
-        self.slider.sliderReleased.connect(self.update_analysis)
-        self.slider.valueChanged.connect(self.preview_baseline)
+        self.slider.valueChanged.connect(self.preview_baseline_only)
+        self.slider.sliderReleased.connect(self.run_full_analysis)
+
+    # ------------------------------- UI Actions -------------------------------
 
     def load_image(self):
-        """Loads and preprocesses an image from the user."""
-        filepath, _ = QFileDialog.getOpenFileName(self, 'Open Image', '', 'Image Files (*.png *.jpg *.bmp)')
-        if not filepath: return
-            
-        self.original_image = cv2.imread(filepath)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp)"
+        )
+        if not path:
+            return
+        img = cv2.imread(path)
+        if img is None:
+            self.image_label.setText("Error: Could not read image.")
+            return
+        h, w = img.shape[:2]
+        if w > 1400:
+            img = cv2.resize(img, (1400, int(h * 1400 / w)), interpolation=cv2.INTER_AREA)
+        self.original_image = img
+        self.run_full_analysis(initial=True)
+
+    def preview_baseline_only(self):
+        if self.overlay is None:
+            return
+        y = self.slider.value()
+        temp = self.overlay.copy()
+        cv2.line(temp, (0, y), (temp.shape[1], y), (255, 0, 0), 2)
+        self.display_image(temp)
+
+    # ----------------------------- Core Processing -----------------------------
+
+    def run_full_analysis(self, initial=False):
         if self.original_image is None:
-            self.image_label.setText("Error: Could not load image."); return
-
-        # Resize large images for consistent performance
-        MAX_WIDTH = 1200
-        h, w, _ = self.original_image.shape
-        if w > MAX_WIDTH:
-            self.original_image = cv2.resize(self.original_image, (MAX_WIDTH, int(h * MAX_WIDTH / w)), interpolation=cv2.INTER_AREA)
-
-        h, _, _ = self.original_image.shape
-        self.slider.blockSignals(True)
-        self.slider.setRange(0, h - 1)
-        self.slider.setValue(int(h * 0.85))
-        self.slider.blockSignals(False)
-
-        # Perform the first full analysis
-        self.update_analysis()
-
-    def preview_baseline(self):
-        """## FIX: Lightweight preview. Uses the last analyzed image and only draws the baseline."""
-        if self.last_analyzed_image is None: return
-        
-        preview_img = self.last_analyzed_image.copy()
-        baseline_y = self.slider.value()
-        cv2.line(preview_img, (0, baseline_y), (preview_img.shape[1], baseline_y), (255, 0, 0), 2)
-        
-        self.display_image(preview_img)
-        
-    def update_analysis(self):
-        """## FIX: Heavy analysis. Recalculates everything and updates the base analyzed image."""
-        if self.original_image is None: return
-
-        # Base image for analysis drawings
-        analysis_img = self.original_image.copy()
-        baseline_y = self.slider.value()
-
-        gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not contours:
-            self.left_angle_label.setText('Left Angle: --°')
-            self.right_angle_label.setText('Right Angle: --°')
-            self.last_analyzed_image = self.original_image.copy() # Reset analyzed image
-            self.preview_baseline() # Show the baseline on the clean image
             return
 
-        droplet_contour = max(contours, key=cv2.contourArea)
-        epsilon = 0.001 * cv2.arcLength(droplet_contour, True)
-        approx_contour = cv2.approxPolyDP(droplet_contour, epsilon, True)
-        
-        apex_point = tuple(approx_contour[approx_contour[:, :, 1].argmin()][0])
-        intersection_points = [tuple(p[0]) for p in approx_contour if abs(p[0][1] - baseline_y) < 5]
+        img = self.original_image.copy()
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        left_contact_point, right_contact_point = None, None
-        if len(intersection_points) >= 2:
-            intersection_points.sort(); left_contact_point = intersection_points[0]; right_contact_point = intersection_points[-1]
+        # 1) Mask & contour
+        mask = adaptive_drop_mask(img)
+        cnt = choose_droplet_contour(mask)
+        if cnt is None:
+            self.left_angle_label.setText("Left Angle: --°")
+            self.right_angle_label.setText("Right Angle: --°")
+            self.display_image(img)
+            return
 
-        # Calculate angles and update labels
-        l_angle = self.calculate_contact_angle(approx_contour, left_contact_point, 'left') if left_contact_point else None
-        r_angle = self.calculate_contact_angle(approx_contour, right_contact_point, 'right') if right_contact_point else None
-        self.left_angle_label.setText(f'Left Angle: {l_angle:.2f}°' if l_angle is not None else 'Left Angle: --°')
-        self.right_angle_label.setText(f'Right Angle: {r_angle:.2f}°' if r_angle is not None else 'Right Angle: --°')
+        # 2) Baseline: auto then user-tunable
+        auto_y = find_auto_baseline_from_contour(cnt)
+        if initial or not self.slider.isEnabled():
+            h = img.shape[0]
+            self.slider.blockSignals(True)
+            self.slider.setRange(0, h - 1)
+            self.slider.setValue(int(np.clip(auto_y, 0, h - 1)))
+            self.slider.setEnabled(True)
+            self.slider.blockSignals(False)
+        baseline_y = int(self.slider.value())
 
-        # Draw analysis results (contour, points) onto the analysis_img
-        cv2.drawContours(analysis_img, [approx_contour], -1, (0, 255, 0), 2)
-        cv2.circle(analysis_img, apex_point, 8, (255, 255, 0), -1)
-        if left_contact_point: cv2.circle(analysis_img, left_contact_point, 8, (0, 0, 255), -1)
-        if right_contact_point: cv2.circle(analysis_img, right_contact_point, 8, (0, 0, 255), -1)
-        
-        # Save this fully drawn image (without baseline) for the preview function to use
-        self.last_analyzed_image = analysis_img
-        
-        # Now call the preview function to draw the final baseline and display
-        self.preview_baseline()
+        # 3) Contact points by circle-fit intersection + gradient refinement
+        l_pt, r_pt = fit_circle_and_intersect(cnt, baseline_y, gray, refine=True)
 
-    def calculate_contact_angle(self, contour, contact_point, side):
-        x, y, w, h = cv2.boundingRect(contour)
-        top_contour = [p for p in contour if p[0][1] < y + h * 0.75]
-        if len(top_contour) < 5: return None
-        (cx, cy), radius = cv2.minEnclosingCircle(np.array(top_contour))
-        p1 = np.array(contact_point)
-        normal_vector = p1 - np.array([cx, cy])
-        if np.isclose(normal_vector[0], 0): return 90.0
-        angle_rad = np.arctan2(normal_vector[1], normal_vector[0])
-        angle_deg = np.degrees(angle_rad)
-        return (180 - angle_deg) if side == 'left' else angle_deg
+        # Fallback: if circle intersection fails, try slope-based near baseline
+        if (l_pt is None) or (r_pt is None):
+            # Simple fallback: choose lowest y on left/right halves
+            pts = cnt[:, 0, :]
+            xs = pts[:, 0]
+            medx = np.median(xs)
+            left_half = pts[xs <= medx]
+            right_half = pts[xs >= medx]
+            if len(left_half):
+                l_pt = tuple(left_half[np.argmax(left_half[:, 1])])
+            if len(right_half):
+                r_pt = tuple(right_half[np.argmax(right_half[:, 1])])
+            # refine these as well
+            l_pt = refine_contact_point(gray, l_pt, 5) if l_pt is not None else None
+            r_pt = refine_contact_point(gray, r_pt, 5) if r_pt is not None else None
 
-    def display_image(self, img_cv):
-        h, w, ch = img_cv.shape
-        q_img = QImage(img_cv.data, w, h, ch * w, QImage.Format_RGB888).rgbSwapped()
-        self.current_pixmap = QPixmap.fromImage(q_img)
-        self.image_label.setPixmap(self.current_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # 4) Angles by local quadratic tangent
+        left_ang = local_poly_contact_angle(cnt, l_pt, window_px=25)
+        right_ang = local_poly_contact_angle(cnt, r_pt, window_px=25)
+        self.left_angle_label.setText(
+            f"Left Angle: {left_ang:.2f}°" if left_ang is not None else "Left Angle: --°"
+        )
+        self.right_angle_label.setText(
+            f"Right Angle: {right_ang:.2f}°" if right_ang is not None else "Right Angle: --°"
+        )
+
+        # 5) Draw overlay & labels
+        vis = img.copy()
+        cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
+        cv2.line(vis, (0, baseline_y), (vis.shape[1], baseline_y), (255, 0, 0), 2)
+
+        apx = apex_of_contour(cnt)
+        if apx is not None:
+            cv2.circle(vis, apx, 7, (255, 255, 0), -1)
+
+        for p, txt in [(l_pt, left_ang), (r_pt, right_ang)]:
+            if p is not None:
+                cv2.circle(vis, (int(p[0]), int(p[1])), 8, (0, 0, 255), -1)
+                # put angle text slightly above/right of the point
+                if txt is not None:
+                    label = f"{txt:.1f}°"
+                    px, py = int(p[0]), int(p[1])
+                    cv2.putText(vis, label, (px + 8, max(py - 10, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
+        self.overlay = vis
+        self.display_image(vis)
+
+    # ------------------------------- Qt Helpers -------------------------------
+
+    def display_image(self, img_bgr):
+        h, w = img_bgr.shape[:2]
+        qimg = QImage(img_bgr.data, w, h, 3 * w, QImage.Format_BGR888)
+        self.current_pixmap = QPixmap.fromImage(qimg)
+        scaled = self.current_pixmap.scaled(
+            self.image_label.width(), self.image_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled)
 
     def resizeEvent(self, event):
-        if self.current_pixmap:
-            self.image_label.setPixmap(self.current_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        super().resizeEvent(event)
+        if self.current_pixmap is not None:
+            scaled = self.current_pixmap.scaled(
+                self.image_label.width(), self.image_label.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled)
 
-if __name__ == '__main__':
+
+# ================================== Main ==================================
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    analyzer = SessileDropAnalyzer()
-    analyzer.show()
+    w = SessileDropAnalyzer()
+    w.show()
     sys.exit(app.exec_())
