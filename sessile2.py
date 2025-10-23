@@ -12,7 +12,6 @@ from PyQt5.QtCore import Qt
 # ============================ Image / Geometry Utils ============================
 
 def adaptive_drop_mask(bgr):
-    """Create a robust binary mask for the droplet under uneven lighting."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     mask = cv2.adaptiveThreshold(
@@ -27,7 +26,6 @@ def adaptive_drop_mask(bgr):
 
 
 def choose_droplet_contour(mask):
-    """Pick the most plausible droplet contour by area × circularity score."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
@@ -45,13 +43,11 @@ def choose_droplet_contour(mask):
 
 
 def find_auto_baseline_from_contour(cnt):
-    """Use a high percentile of contour y to place the baseline near the bottom."""
     ys = cnt[:, 0, 1]
     return int(np.percentile(ys, 95))
 
 
 def refine_contact_point(gray, point, search_radius=5):
-    """Shift the point to the location of maximum intensity gradient magnitude."""
     if point is None:
         return None
     x0, y0 = int(point[0]), int(point[1])
@@ -72,44 +68,28 @@ def refine_contact_point(gray, point, search_radius=5):
 
 
 def fit_circle_and_intersect(cnt, baseline_y, gray=None, refine=True):
-    """
-    Fit a circle to the *upper* contour (avoid distorted base) and intersect with baseline.
-    Optionally refine intersection locations by local gradient.
-    """
     pts = cnt[:, 0, :].astype(np.float32)
     if len(pts) < 10:
         return None, None
-
-    # keep only the upper 70% of points (y smaller = higher in image)
     y_min, y_max = np.min(pts[:, 1]), np.max(pts[:, 1])
     cutoff = y_min + 0.70 * (y_max - y_min)
     upper = pts[pts[:, 1] < cutoff]
     if len(upper) < 10:
-        upper = pts  # fallback
-
+        upper = pts
     (cx, cy), r = cv2.minEnclosingCircle(upper)
-
-    # Intersections of (x - cx)^2 + (y - cy)^2 = r^2 with y = baseline_y
     dy = baseline_y - cy
     if abs(dy) >= r:
-        return None, None  # circle doesn't cross baseline
-    dx = float(np.sqrt(max(r * r - dy * dy, 0.0)))
-
-    left  = (int(round(cx - dx)), int(baseline_y))
+        return None, None
+    dx = np.sqrt(max(r * r - dy * dy, 0.0))
+    left = (int(round(cx - dx)), int(baseline_y))
     right = (int(round(cx + dx)), int(baseline_y))
-
     if refine and gray is not None:
-        left  = refine_contact_point(gray, left, 5)
+        left = refine_contact_point(gray, left, 5)
         right = refine_contact_point(gray, right, 5)
-
     return left, right
 
 
 def local_poly_contact_angle(cnt, contact_pt, window_px=25):
-    """
-    Local quadratic fit around contact point, then angle = atan(|dy/dx|).
-    Returns angle in degrees.
-    """
     if contact_pt is None:
         return None
     cx, _ = contact_pt
@@ -119,25 +99,44 @@ def local_poly_contact_angle(cnt, contact_pt, window_px=25):
         nb = pts[np.abs(pts[:, 0] - cx) < window_px * 1.8]
     if len(nb) < 8:
         return None
-
     x = nb[:, 0].astype(np.float64)
     y = nb[:, 1].astype(np.float64)
     try:
         a, b, c = np.polyfit(x, y, 2)
     except Exception:
         return None
-
     m = 2.0 * a * cx + b
     theta = np.degrees(np.arctan(np.abs(m)))
     return float(np.clip(theta, 0.0, 175.0))
 
 
 def apex_of_contour(cnt):
-    """Highest point (minimum y)."""
     if cnt is None or len(cnt) == 0:
         return None
     idx = np.argmin(cnt[:, 0, 1])
     return tuple(cnt[idx, 0, :])
+
+
+# ============================ NEW FUNCTIONALITY: AUTO BASELINE ============================
+
+def detect_auto_baseline(gray):
+    """
+    Detect the stable substrate baseline (automatic version).
+    Uses Sobel Y gradients to find strong horizontal edge region.
+    """
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edges = np.uint8(np.absolute(sobel_y))
+    edges = cv2.GaussianBlur(edges, (9, 9), 0)
+
+    h = gray.shape[0]
+    bottom_half = edges[int(h * 0.5):, :]
+    row_strength = np.mean(bottom_half, axis=1)
+
+    y_rel = np.where(row_strength > np.percentile(row_strength, 95))[0]
+    if len(y_rel) == 0:
+        return int(h * 0.9)
+    baseline_y = int(h * 0.5 + np.median(y_rel))
+    return baseline_y
 
 
 # ============================ PyQt5 Application ============================
@@ -145,17 +144,14 @@ def apex_of_contour(cnt):
 class SessileDropAnalyzer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sessile Drop Contact Angle Analyzer (Circle-Fit + Refinement)")
+        self.setWindowTitle("Sessile Drop Contact Angle Analyzer (Circle-Fit + Auto Baseline Add-on)")
         self.setGeometry(100, 100, 1150, 830)
 
         self.original_image = None
         self.current_pixmap = None
         self.overlay = None
 
-        # --- Layout / Widgets ---
         layout = QVBoxLayout(self)
-        self.setLayout(layout)
-
         self.image_label = QLabel("Load a side-view droplet image.")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("border: 2px solid #888;")
@@ -166,7 +162,9 @@ class SessileDropAnalyzer(QWidget):
         controls = QHBoxLayout()
         layout.addLayout(controls)
         self.btn_load = QPushButton("Load Image")
+        self.btn_auto_baseline = QPushButton("Auto Baseline")  # ✅ added safely
         controls.addWidget(self.btn_load)
+        controls.addWidget(self.btn_auto_baseline)
         controls.addWidget(QLabel("Baseline (y):"))
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
@@ -179,8 +177,9 @@ class SessileDropAnalyzer(QWidget):
         results.addWidget(self.left_angle_label)
         results.addWidget(self.right_angle_label)
 
-        # --- Signals ---
+        # Signals
         self.btn_load.clicked.connect(self.load_image)
+        self.btn_auto_baseline.clicked.connect(self.auto_detect_baseline)  # ✅ new signal
         self.slider.valueChanged.connect(self.preview_baseline_only)
         self.slider.sliderReleased.connect(self.run_full_analysis)
 
@@ -210,6 +209,17 @@ class SessileDropAnalyzer(QWidget):
         cv2.line(temp, (0, y), (temp.shape[1], y), (255, 0, 0), 2)
         self.display_image(temp)
 
+    # ----------------------------- NEW FUNCTION -----------------------------
+
+    def auto_detect_baseline(self):
+        """Auto baseline finder – does NOT alter other functions."""
+        if self.original_image is None:
+            return
+        gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+        baseline_y = detect_auto_baseline(gray)
+        self.slider.setValue(baseline_y)
+        self.run_full_analysis()
+
     # ----------------------------- Core Processing -----------------------------
 
     def run_full_analysis(self, initial=False):
@@ -218,8 +228,6 @@ class SessileDropAnalyzer(QWidget):
 
         img = self.original_image.copy()
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 1) Mask & contour
         mask = adaptive_drop_mask(img)
         cnt = choose_droplet_contour(mask)
         if cnt is None:
@@ -227,8 +235,6 @@ class SessileDropAnalyzer(QWidget):
             self.right_angle_label.setText("Right Angle: --°")
             self.display_image(img)
             return
-
-        # 2) Baseline: auto then user-tunable
         auto_y = find_auto_baseline_from_contour(cnt)
         if initial or not self.slider.isEnabled():
             h = img.shape[0]
@@ -238,13 +244,8 @@ class SessileDropAnalyzer(QWidget):
             self.slider.setEnabled(True)
             self.slider.blockSignals(False)
         baseline_y = int(self.slider.value())
-
-        # 3) Contact points by circle-fit intersection + gradient refinement
         l_pt, r_pt = fit_circle_and_intersect(cnt, baseline_y, gray, refine=True)
-
-        # Fallback: if circle intersection fails, try slope-based near baseline
         if (l_pt is None) or (r_pt is None):
-            # Simple fallback: choose lowest y on left/right halves
             pts = cnt[:, 0, :]
             xs = pts[:, 0]
             medx = np.median(xs)
@@ -254,11 +255,8 @@ class SessileDropAnalyzer(QWidget):
                 l_pt = tuple(left_half[np.argmax(left_half[:, 1])])
             if len(right_half):
                 r_pt = tuple(right_half[np.argmax(right_half[:, 1])])
-            # refine these as well
             l_pt = refine_contact_point(gray, l_pt, 5) if l_pt is not None else None
             r_pt = refine_contact_point(gray, r_pt, 5) if r_pt is not None else None
-
-        # 4) Angles by local quadratic tangent
         left_ang = local_poly_contact_angle(cnt, l_pt, window_px=25)
         right_ang = local_poly_contact_angle(cnt, r_pt, window_px=25)
         self.left_angle_label.setText(
@@ -267,30 +265,22 @@ class SessileDropAnalyzer(QWidget):
         self.right_angle_label.setText(
             f"Right Angle: {right_ang:.2f}°" if right_ang is not None else "Right Angle: --°"
         )
-
-        # 5) Draw overlay & labels
         vis = img.copy()
         cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
         cv2.line(vis, (0, baseline_y), (vis.shape[1], baseline_y), (255, 0, 0), 2)
-
         apx = apex_of_contour(cnt)
         if apx is not None:
             cv2.circle(vis, apx, 7, (255, 255, 0), -1)
-
         for p, txt in [(l_pt, left_ang), (r_pt, right_ang)]:
             if p is not None:
                 cv2.circle(vis, (int(p[0]), int(p[1])), 8, (0, 0, 255), -1)
-                # put angle text slightly above/right of the point
                 if txt is not None:
                     label = f"{txt:.1f}°"
                     px, py = int(p[0]), int(p[1])
                     cv2.putText(vis, label, (px + 8, max(py - 10, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-
         self.overlay = vis
         self.display_image(vis)
-
-    # ------------------------------- Qt Helpers -------------------------------
 
     def display_image(self, img_bgr):
         h, w = img_bgr.shape[:2]
