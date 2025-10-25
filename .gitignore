@@ -1,1 +1,110 @@
+
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# -----------------------------
+# Python cache / build files
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# -----------------------------
+# Virtual environments
+# -----------------------------
+.env
+venv/
+ENV/
+env.bak/
+venv.bak/
+disa1/
+disa2/
+
+# -----------------------------
+# PyInstaller / Build Artifacts
+# -----------------------------
+*.manifest
+*.spec
+
+# -----------------------------
+# IDE and editor files
+# -----------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -----------------------------
+# Qt / PyQt generated files
+# -----------------------------
+*.pyproject
+*.ui~
+*.qrc~
+*.pro.user
+*.pro.user.*
+*.qmlc
+*.jsc
+*.qbs.user
+*.qbs.user.*
+*.moc
+*.obj
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.ncb
+*.sdf
+*.suo
+*.ipch
+
+# -----------------------------
+# Logs and runtime output
+# -----------------------------
+*.log
+*.out
+*.tmp
+*.bak
+
+# -----------------------------
+# Image / video test data
+# (Exclude raw captures or analysis output)
+# -----------------------------
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+
+# -----------------------------
+# Local notebooks / experiments
+# -----------------------------
+*.ipynb_checkpoints
