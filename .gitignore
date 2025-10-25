@@ -36,12 +36,12 @@ MANIFEST
 # Virtual environments
 # -----------------------------
 .env
-venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/
-disa1/
-disa2/
+disa1/*
+disa2/*
 
 # -----------------------------
 # PyInstaller / Build Artifacts
