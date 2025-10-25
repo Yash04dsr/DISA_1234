@@ -57,57 +57,8 @@ def detect_drop_contour(bgr):
     if best is not None:
         best[:, 0, 1] += roi_top
     return best, needle_row, roi_top
-# def detect_drop_contour(bgr):
-#     """Contour detection robust to background and reflection noise."""
-#     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-#     gray = cv2.GaussianBlur(gray, (7, 7), 0)
 
-#     # Invert image if droplet is darker than background
-#     if np.mean(gray[:50, :]) > np.mean(gray[-50:, :]):
-#         gray = cv2.bitwise_not(gray)
 
-#     # --- Adaptive + Otsu combo threshold ---
-#     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-#     adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-#                                   cv2.THRESH_BINARY, 51, 2)
-#     combined = cv2.bitwise_and(otsu, adapt)
-
-#     # --- Morphology cleanup ---
-#     kernel = np.ones((5, 5), np.uint8)
-#     clean = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-#     clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel, iterations=1)
-
-#     # --- Invert if needed (make droplet white) ---
-#     white_ratio = np.sum(clean == 255) / clean.size
-#     if white_ratio < 0.5:
-#         clean = cv2.bitwise_not(clean)
-
-#     # --- Contour extraction ---
-#     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-#     if not contours:
-#         return None, 0, 0
-
-#     h, w = gray.shape
-#     frame_margin = 10
-
-#     best, best_score = None, -1
-#     for c in contours:
-#         area = cv2.contourArea(c)
-#         if area < 300:
-#             continue
-#         x, y, cw, ch = cv2.boundingRect(c)
-#         if x <= frame_margin or y <= frame_margin or x + cw >= w - frame_margin:
-#             continue  # ignore touching edges (background)
-#         ys = c[:, 0, 1]
-#         y_mean = np.mean(ys)
-#         per = cv2.arcLength(c, True)
-#         circ = 4 * np.pi * area / (per * per + 1e-6)
-#         # prefer large, compact, low droplet shapes
-#         score = area * circ * (y_mean / h)
-#         if score > best_score:
-#             best, best_score = c, score
-
-#     return best, 0, 0
 
 
 # ============================ GUI Application ============================
