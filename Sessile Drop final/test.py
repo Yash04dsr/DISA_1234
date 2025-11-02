@@ -416,7 +416,7 @@ class SessileDropAnalyzer(QWidget):
                 bx = px + 10 if px + 10 + tw < img.shape[1] else px - 10 - tw
                 by = py - 10 if py - 10 - th > 0 else py + 10 + th
                 cv2.rectangle(img, (bx - 4, by - th - 4), (bx + tw + 4, by + 4), (255, 255, 255), -1)
-                cv2.putText(img, label, (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                
                 # optional small arc
                 if self.chk_arcs.isChecked() and angle is not None and slope is not None:
                     side = 'left' if side_name == 'L' else 'right'
